@@ -1,0 +1,217 @@
+heat_template_version: 2016-10-14
+
+description: Simple Test Stack for validating the functinallity of the Heat Service
+
+parameters:
+  public_network:
+    type: string
+    default: provider
+  flavor:
+    type: string
+    default: e1.small
+    constraints:
+      - custom_constraint: nova.flavor
+  image:
+    type: string
+    default: Ubuntu 22.04 Jammy Jellyfish - Latest
+    constraints:
+      - custom_constraint: glance.image
+  ssh_key:
+    type: string
+    default: mv
+    constraints:
+      - custom_constraint: nova.keypair
+
+resources:
+
+  sec_grp:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: All Heat Rules
+      name: HEAT EXAMPLE 
+      rules:
+        - { direction: egress, remote_ip_prefix: 0.0.0.0/0 }
+        - { direction: ingress, remote_ip_prefix: 0.0.0.0/0, protocol: icmp }
+        - { direction: ingress, remote_ip_prefix: 0.0.0.0/0, protocol: tcp, port_range_min: 22, port_range_max: 22 }
+        - { direction: ingress, remote_ip_prefix: 0.0.0.0/0, protocol: tcp, port_range_min: 80, port_range_max: 80 }
+
+  net:
+    type: OS::Neutron::Net
+    properties:
+      name: heat-test-net
+
+  subnet:
+    type: OS::Neutron::Subnet
+    depends_on: [ net ]
+    properties:
+      name: heat-test-subnet
+      network: { get_resource: net }
+      ip_version: 4
+      cidr: 10.0.0.0/24
+      allocation_pools:
+        - { start: 10.0.0.10, end: 10.0.0.250 }
+
+  router:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info: {"network": { get_param: public_network }}
+
+  router_interface:
+    type: OS::Neutron::RouterInterface
+    depends_on: [ subnet, router ]
+    properties:
+      router: { get_resource: router }
+      subnet: { get_resource: subnet }
+
+  port:
+    type: OS::Neutron::Port
+    depends_on: [ net, sec_grp ]
+    properties:
+      network: { get_resource: net }
+      security_groups: [ get_resource: sec_grp ]
+
+  cloud_init:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        packages:
+          - vim
+          - curl
+          - wget
+          - nginx
+          - telnet
+          - iperf3
+          - htop
+          - iotop
+        write_files:
+          - content: |
+              #!/usr/bin/env bash
+              until ping -c 1 google.de > /dev/null; do sleep 1; done
+              echo "test server 1" > /var/www/html/index.html
+            path: /root/bootstrap_heat.sh
+            permissions: 0744
+        runcmd:
+          - /root/bootstrap_heat.sh
+
+  host:
+    type: OS::Nova::Server
+    properties:
+      name: heat-test-server
+      user_data_format: RAW
+      user_data: { get_resource: cloud_init }
+      image: { get_param: image }
+      key_name: { get_param: ssh_key }
+      flavor: { get_param: flavor }
+      networks:
+        - port: { get_resource: port }
+
+  floating_ip:
+    type: OS::Neutron::FloatingIP
+    depends_on: [ port ]
+    properties:
+      floating_network: { get_param: public_network }
+      port_id: { get_resource: port }
+
+  port2:
+    type: OS::Neutron::Port
+    depends_on: [ net, sec_grp ]
+    properties:
+      network: { get_resource: net }
+      security_groups: [ get_resource: sec_grp ]
+
+  cloud_init2:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        packages:
+          - vim
+          - curl
+          - wget
+          - nginx
+        write_files:
+          - content: |
+              #!/usr/bin/env bash
+              until ping -c 1 google.de > /dev/null; do sleep 1; done
+              echo "test server 2" > /var/www/html/index.html
+            path: /root/bootstrap_heat.sh
+            permissions: 0744
+        runcmd:
+          - /root/bootstrap_heat.sh
+
+  host2:
+    type: OS::Nova::Server
+    properties:
+      name: heat-test-server2
+      user_data_format: RAW
+      user_data: { get_resource: cloud_init2 }
+      image: { get_param: image }
+      key_name: { get_param: ssh_key }
+      flavor: { get_param: flavor }
+      networks:
+        - port: { get_resource: port2 }
+
+  floating_ip2:
+    type: OS::Neutron::FloatingIP
+    depends_on: [ port2 ]
+    properties:
+      floating_network: { get_param: public_network }
+      port_id: { get_resource: port2 }
+
+        ############
+
+  monitor:
+    type: OS::Octavia::HealthMonitor
+    depends_on: [ pool ]
+    properties:
+      delay: 3
+      type: HTTP 
+      timeout: 3
+      max_retries: 3
+      pool: { get_resource: pool }
+
+  pool:
+    type: OS::Octavia::Pool
+    depends_on: [ listener ]
+    properties:
+      lb_algorithm: ROUND_ROBIN
+      protocol: HTTP
+      listener: { get_resource: listener }
+      name: pool
+
+  listener:
+    type: OS::Octavia::Listener
+    depends_on: [ loadbalancer ]
+    properties:
+      loadbalancer: { get_resource: loadbalancer }
+      protocol: HTTP
+      protocol_port: 80
+      name: listener
+
+  loadbalancer:
+    depends_on: [ subnet ]
+    type: OS::Octavia::LoadBalancer
+    properties:
+      vip_subnet: { get_resource: subnet }
+      name: heat-loadbalancer
+
+  floating_ip_lb:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: { get_param: public_network }
+      port_id: { get_attr: [loadbalancer, vip_port_id ]}
+
+  member:
+    type: OS::Octavia::PoolMember
+    properties:
+      address: { get_attr: [host, first_address ]} 
+      pool: { get_resource: pool }
+      protocol_port: 80
+      subnet: { get_resource: subnet }
+  
+  member2:
+    type: OS::Octavia::PoolMember
+    properties:
+      address: { get_attr: [host2, first_address ]} 
+      pool: { get_resource: pool }
+      protocol_port: 80
+      subnet: { get_resource: subnet }
